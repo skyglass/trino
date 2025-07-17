@@ -13,63 +13,57 @@
  */
 package io.trino.plugin.exasol;
 
-import com.google.common.collect.ImmutableSet;
-import com.google.inject.Inject;
-import io.trino.plugin.base.mapping.IdentifierMapping;
-import io.trino.plugin.jdbc.BaseJdbcClient;
-import io.trino.plugin.jdbc.BaseJdbcConfig;
-import io.trino.plugin.jdbc.ColumnMapping;
-import io.trino.plugin.jdbc.ConnectionFactory;
-import io.trino.plugin.jdbc.JdbcColumnHandle;
-import io.trino.plugin.jdbc.JdbcExpression;
-import io.trino.plugin.jdbc.JdbcJoinCondition;
-import io.trino.plugin.jdbc.JdbcOutputTableHandle;
-import io.trino.plugin.jdbc.JdbcTableHandle;
-import io.trino.plugin.jdbc.JdbcTypeHandle;
-import io.trino.plugin.jdbc.LongReadFunction;
-import io.trino.plugin.jdbc.LongWriteFunction;
-import io.trino.plugin.jdbc.QueryBuilder;
-import io.trino.plugin.jdbc.WriteFunction;
-import io.trino.plugin.jdbc.WriteMapping;
-import io.trino.plugin.jdbc.logging.RemoteQueryModifier;
-import io.trino.spi.TrinoException;
-import io.trino.spi.connector.AggregateFunction;
-import io.trino.spi.connector.ColumnHandle;
-import io.trino.spi.connector.ColumnMetadata;
-import io.trino.spi.connector.ColumnPosition;
-import io.trino.spi.connector.ConnectorSession;
-import io.trino.spi.connector.ConnectorTableMetadata;
-import io.trino.spi.type.Type;
-
-import java.sql.Connection;
-import java.sql.Date;
-import java.sql.Types;
-import java.time.LocalDate;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.OptionalLong;
-import java.util.Set;
-
-import static io.trino.plugin.jdbc.StandardColumnMappings.bigintColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.booleanColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.decimalColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultCharColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.defaultVarcharColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.doubleColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.integerColumnMapping;
-import static io.trino.plugin.jdbc.StandardColumnMappings.smallintColumnMapping;
+import static com.google.common.base.Preconditions.checkArgument;
+import static io.trino.plugin.jdbc.PredicatePushdownController.FULL_PUSHDOWN;
+import static io.trino.plugin.jdbc.StandardColumnMappings.*;
 import static io.trino.plugin.jdbc.TypeHandlingJdbcSessionProperties.getUnsupportedTypeHandling;
 import static io.trino.plugin.jdbc.UnsupportedTypeHandling.CONVERT_TO_VARCHAR;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.connector.ConnectorMetadata.MODIFYING_ROWS_MESSAGE;
+import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
+import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DecimalType.createDecimalType;
+import static io.trino.spi.type.TimestampType.MAX_SHORT_PRECISION;
+import static io.trino.spi.type.TimestampType.createTimestampType;
+import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MILLIS;
+import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
+
+import java.sql.*;
+import java.sql.Date;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
+import java.util.*;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.inject.Inject;
+
+import io.trino.plugin.base.mapping.IdentifierMapping;
+import io.trino.plugin.jdbc.*;
+import io.trino.plugin.jdbc.logging.RemoteQueryModifier;
+import io.trino.spi.TrinoException;
+import io.trino.spi.connector.*;
+import io.trino.spi.type.LongTimestamp;
+import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.Type;
 
 public class ExasolClient
         extends BaseJdbcClient
 {
+    private static final int EXASOL_TIMESTAMP = 124;
+    private static final int MAX_EXASOL_TIMESTAMP_PRECISION = 9;
+    private static final DateTimeFormatter TIMESTAMP_NANO_OPTIONAL_FORMATTER = new DateTimeFormatterBuilder()
+            .appendPattern("uuuu-MM-dd HH:mm:ss")
+            .optionalStart()
+            .appendFraction(ChronoField.NANO_OF_SECOND, 0, 9, true)
+            .optionalEnd()
+            .toFormatter();
     private static final Set<String> INTERNAL_SCHEMAS = ImmutableSet.<String>builder()
             .add("EXA_STATISTICS")
             .add("SYS")
@@ -229,6 +223,11 @@ public class ExasolClient
                 return Optional.of(defaultVarcharColumnMapping(typeHandle.requiredColumnSize(), true));
             case Types.DATE:
                 return Optional.of(dateColumnMapping());
+            case Types.TIMESTAMP:
+                int timestampPrecision = typeHandle.requiredDecimalDigits();
+                return Optional.of(timestampColumnMapping(createTimestampType(timestampPrecision)));
+            case EXASOL_TIMESTAMP:
+                return Optional.of(exasolTimestampWithTimeZoneColumnMapping(session));
         }
 
         if (getUnsupportedTypeHandling(session) == CONVERT_TO_VARCHAR) {
@@ -244,6 +243,142 @@ public class ExasolClient
                 DATE,
                 dateReadFunctionUsingSqlDate(),
                 dateWriteFunctionUsingSqlDate());
+    }
+
+    private static ColumnMapping timestampColumnMapping(TimestampType timestampType)
+    {
+        if (timestampType.isShort()) {
+            return ColumnMapping.longMapping(
+                    timestampType,
+                    timestampReadFunction(timestampType),
+                    timestampWriteFunction(timestampType),
+                    FULL_PUSHDOWN);
+        }
+        return ColumnMapping.objectMapping(
+                timestampType,
+                longTimestampReadFunction(timestampType),
+                longTimestampWriteFunction(timestampType),
+                FULL_PUSHDOWN);
+    }
+
+    private static LongReadFunction timestampReadFunction(TimestampType timestampType)
+    {
+        return (resultSet, columnIndex) -> {
+            Timestamp timestamp = resultSet.getObject(columnIndex, Timestamp.class);
+            return toTrinoTimestamp(timestampType, timestamp.toLocalDateTime());
+        };
+    }
+
+    private static ObjectReadFunction longTimestampReadFunction(TimestampType timestampType)
+    {
+        verifyLongTimestampPrecision(timestampType);
+        return ObjectReadFunction.of(
+                LongTimestamp.class,
+                (resultSet, columnIndex) -> {
+                    Timestamp timestamp = resultSet.getObject(columnIndex, Timestamp.class);
+                    return toLongTrinoTimestamp(timestampType, timestamp.toLocalDateTime());
+                });
+    }
+
+    private static void verifyLongTimestampPrecision(TimestampType timestampType)
+    {
+        int precision = timestampType.getPrecision();
+        checkArgument(precision > MAX_SHORT_PRECISION && precision <= MAX_EXASOL_TIMESTAMP_PRECISION,
+                "Precision is out of range: %s", precision);
+    }
+
+    private static ObjectWriteFunction longTimestampWriteFunction(TimestampType timestampType)
+    {
+        int precision = timestampType.getPrecision();
+        verifyLongTimestampPrecision(timestampType);
+
+        return new ObjectWriteFunction() {
+            @Override
+            public Class<?> getJavaType()
+            {
+                return LongTimestamp.class;
+            }
+
+            @Override
+            public void set(PreparedStatement statement, int index, Object value)
+                    throws SQLException
+            {
+                LocalDateTime timestamp = fromLongTrinoTimestamp((LongTimestamp) value, precision);
+                statement.setString(index, TIMESTAMP_NANO_OPTIONAL_FORMATTER.format(timestamp));
+            }
+
+            @Override
+            public String getBindExpression()
+            {
+                return getTimestampBindExpression(precision);
+            }
+
+            @Override
+            public void setNull(PreparedStatement statement, int index)
+                    throws SQLException
+            {
+                statement.setNull(index, Types.VARCHAR);
+            }
+        };
+    }
+
+    private static String getTimestampBindExpression(int precision)
+    {
+        if (precision <= 0) {
+            return "TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS')";
+        } else {
+            return format("TO_TIMESTAMP(?, 'YYYY-MM-DD HH24:MI:SS.FF%d')", precision);
+        }
+    }
+
+    private static LongWriteFunction timestampWriteFunction(TimestampType timestampType)
+    {
+        return new LongWriteFunction()
+        {
+            @Override
+            public String getBindExpression()
+            {
+                return getTimestampBindExpression(timestampType.getPrecision());
+            }
+
+            @Override
+            public void set(PreparedStatement statement, int index, long epochMicros)
+                    throws SQLException
+            {
+                LocalDateTime timestamp = fromTrinoTimestamp(epochMicros);
+                statement.setString(index, TIMESTAMP_NANO_OPTIONAL_FORMATTER.format(timestamp));
+            }
+
+            @Override
+            public void setNull(PreparedStatement statement, int index)
+                    throws SQLException
+            {
+                statement.setNull(index, Types.VARCHAR);
+            }
+        };
+    }
+
+
+    public static ColumnMapping exasolTimestampWithTimeZoneColumnMapping(ConnectorSession session) {
+        ZoneId sessionZone = session.getTimeZoneKey().getZoneId();
+
+        return ColumnMapping.longMapping(
+                TIMESTAMP_TZ_MILLIS,
+                (resultSet, columnIndex) -> {
+                    Timestamp timestamp = resultSet.getTimestamp(columnIndex);
+                    return packDateTimeWithZone(timestamp.getTime(), sessionZone.getId());
+                },
+                exasolTimestampWithTimeZoneWriteFunction(sessionZone),
+                FULL_PUSHDOWN
+        );
+    }
+
+    public static LongWriteFunction exasolTimestampWithTimeZoneWriteFunction(ZoneId sessionZone) {
+        return LongWriteFunction.of(EXASOL_TIMESTAMP, (statement, index, encodedTimeWithZone) -> {
+            Instant time = Instant.ofEpochMilli(unpackMillisUtc(encodedTimeWithZone));
+            Timestamp timestamp = Timestamp.from(time.atZone(sessionZone).toInstant());
+            statement.setTimestamp(index, timestamp);
+        });
     }
 
     private static LongReadFunction dateReadFunctionUsingSqlDate()
