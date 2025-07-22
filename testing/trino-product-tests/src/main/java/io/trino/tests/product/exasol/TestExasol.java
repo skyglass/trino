@@ -17,6 +17,7 @@ import io.trino.tempto.ProductTest;
 import org.testng.annotations.Test;
 
 import java.math.BigDecimal;
+import java.sql.Timestamp;
 
 import static io.trino.tempto.assertions.QueryAssert.Row.row;
 import static io.trino.tempto.assertions.QueryAssert.assertThat;
@@ -34,12 +35,38 @@ public class TestExasol
     {
         String schemaName = "test_" + randomNameSuffix();
         String tableName = schemaName + ".tab";
+
         onExasol().executeQuery("CREATE SCHEMA " + schemaName);
+
         try {
-            onExasol().executeQuery("CREATE TABLE " + tableName + " (id integer, name varchar(5))");
-            onExasol().executeQuery("INSERT INTO " + tableName + " VALUES (1, 'a')");
+            onExasol().executeQuery("""
+                    CREATE TABLE %s (
+                        id INTEGER,
+                        name VARCHAR(5),
+                        tmstmp TIMESTAMP(6),
+                        tmstmp_timezone TIMESTAMP(6) WITH LOCAL TIME ZONE
+                    )
+                    """.formatted(tableName));
+
+            onExasol().executeQuery("""
+                    INSERT INTO %s
+                    VALUES (
+                        1,
+                        'a',
+                        TO_TIMESTAMP('2018-04-01 02:13:55.123456', 'YYYY-MM-DD HH24:MI:SS.FF6'),
+                        TO_TIMESTAMP('2018-04-01 02:13:55.123456', 'YYYY-MM-DD HH24:MI:SS.FF6')
+                    )
+                    """.formatted(tableName));
+
+            Timestamp expectedTimestamp = Timestamp.valueOf("2018-04-01 02:13:55.123456");
+
             assertThat(onTrino().executeQuery("SELECT * FROM " + tableName))
-                    .containsOnly(row(BigDecimal.valueOf(1), "a"));
+                    .containsOnly(row(
+                            BigDecimal.valueOf(1),
+                            "a",
+                            expectedTimestamp,
+                            expectedTimestamp
+                    ));
         }
         finally {
             onExasol().executeQuery("DROP TABLE IF EXISTS " + tableName);
