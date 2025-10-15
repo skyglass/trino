@@ -78,11 +78,11 @@ public final class ExasolIcebergQueryRunner
                 // Iceberg + Nessie catalog ---
                 Map<String, String> icebergProperties = new HashMap<>();
                 icebergProperties.put("iceberg.catalog.type", "nessie");
-                icebergProperties.put("iceberg.nessie-catalog.uri", "http://host.docker.internal:19120/api/v1");
+                icebergProperties.put("iceberg.nessie-catalog.uri", "http://127.0.0.1:19120/api/v1");
                 icebergProperties.put("iceberg.nessie-catalog.ref", "main");
                 icebergProperties.put("iceberg.nessie-catalog.default-warehouse-dir", "s3://iceberg");
                 icebergProperties.put("fs.native-s3.enabled", "true");
-                icebergProperties.put("s3.endpoint", "http://host.docker.internal:9000");
+                icebergProperties.put("s3.endpoint", "http://127.0.0.1:9000");
                 icebergProperties.put("s3.region", "us-east-1");
                 icebergProperties.put("s3.path-style-access", "true");
                 icebergProperties.put("s3.aws-access-key", "admin");
